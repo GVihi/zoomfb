@@ -31,10 +31,10 @@ public final class Hooks {
         return Input.fullbright ? Math.max(v, Config.fbNightVision) : v;
     }
 
-    /** Called at the end of the in-game GUI render method with Minecraft's graphics object. */
-    public static void hud(Object graphics) {
+    /** Called at the end of Minecraft's in-game HUD render method with the Hud and graphics objects. */
+    public static void hud(Object gameHud, Object graphics) {
         try {
-            Hud.render(graphics);
+            Hud.render(gameHud, graphics);
         } catch (Throwable ignored) {
             // never break rendering because of the overlay
         }

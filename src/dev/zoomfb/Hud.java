@@ -23,8 +23,9 @@ final class Hud {
     private static boolean broken;
 
     // Minecraft access
-    private static Method getInstance;
-    private static Field playerField, fontField, optionsField, hideGuiField;
+    private static Field minecraftField, playerField;
+    private static Method getInstance;          // fallback only
+    private static Method getFont, isHidden;    // on the game's Hud object
     private static Method getX, getY, getZ;
 
     // graphics text method: (Font, String, int x, int y, int color[, boolean shadow])
@@ -37,27 +38,24 @@ final class Hud {
     private static int fps;
     private static long lastFrame;
 
-    static void render(Object graphics) {
-        if (broken || graphics == null) return;
+    static void render(Object gameHud, Object graphics) {
+        if (broken || gameHud == null || graphics == null) return;
         if (!Input.hud) return;
 
         long now = System.nanoTime();
         countFrame(now);
 
         try {
-            if (!resolved) resolve(graphics);
+            if (!resolved) resolve(gameHud, graphics);
             if (broken) return;
 
-            Object mc = getInstance.invoke(null);
+            // Respect F1 (hide GUI): Hud.isHidden()
+            if (isHidden != null && (boolean) isHidden.invoke(gameHud)) return;
+
+            Object mc = minecraftField != null ? minecraftField.get(gameHud) : getInstance.invoke(null);
             if (mc == null) return;
 
-            // Respect F1 (hide GUI) when we could find that flag.
-            if (hideGuiField != null && optionsField != null) {
-                Object opts = optionsField.get(mc);
-                if (opts != null && hideGuiField.getBoolean(opts)) return;
-            }
-
-            Object font = fontField.get(mc);
+            Object font = getFont.invoke(gameHud);
             if (font == null) return;
 
             int x = Config.hudX;
@@ -120,51 +118,51 @@ final class Hud {
 
     // -------------------------------------------------------- lookup
 
-    private static void resolve(Object graphics) {
+    private static void resolve(Object gameHud, Object graphics) {
         resolved = true;
         try {
-            ClassLoader cl = graphics.getClass().getClassLoader();
-            Class<?> mcClass = Class.forName("net.minecraft.client.Minecraft", false, cl);
+            Class<?> hudClass = gameHud.getClass();
 
-            // static Minecraft getInstance()
-            for (Method m : mcClass.getDeclaredMethods()) {
-                if (Modifier.isStatic(m.getModifiers()) && m.getParameterCount() == 0
-                        && m.getReturnType() == mcClass) {
-                    getInstance = m;
-                    break;
+            // The Hud keeps a reference to the Minecraft instance; use it (found by type).
+            minecraftField = fieldBySimpleType(hudClass, "Minecraft");
+            Class<?> mcClass;
+            if (minecraftField != null) {
+                mcClass = minecraftField.getType();
+            } else {
+                ClassLoader cl = graphics.getClass().getClassLoader();
+                mcClass = Class.forName("net.minecraft.client.Minecraft", false, cl);
+                for (Method m : mcClass.getDeclaredMethods()) {
+                    if (Modifier.isStatic(m.getModifiers()) && m.getParameterCount() == 0
+                            && m.getReturnType() == mcClass) {
+                        getInstance = m;
+                        break;
+                    }
                 }
+                if (getInstance == null) throw new IllegalStateException("Minecraft instance not found");
+                getInstance.setAccessible(true);
             }
-            if (getInstance == null) throw new IllegalStateException("Minecraft.getInstance not found");
-            getInstance.setAccessible(true);
 
             playerField = fieldBySimpleType(mcClass, "LocalPlayer");
             if (playerField == null) throw new IllegalStateException("player field not found");
 
-            fontField = fieldByExactType(mcClass, "net.minecraft.client.gui.Font");
-            if (fontField == null) fontField = fieldBySimpleType(mcClass, "Font");
-            if (fontField == null) throw new IllegalStateException("font field not found");
+            getFont = hudClass.getMethod("getFont");
+            Class<?> fontClass = getFont.getReturnType();
+
+            try {
+                isHidden = hudClass.getMethod("isHidden");
+                if (isHidden.getReturnType() != boolean.class) isHidden = null;
+            } catch (NoSuchMethodException e) {
+                isHidden = null; // F1 support is optional
+            }
 
             Class<?> playerClass = playerField.getType();
             getX = playerClass.getMethod("getX");
             getY = playerClass.getMethod("getY");
             getZ = playerClass.getMethod("getZ");
 
-            Class<?> fontClass = fontField.getType();
             textMethod = findTextMethod(graphics.getClass(), fontClass);
             if (textMethod == null) throw new IllegalStateException("text drawing method not found");
             textHasShadowArg = textMethod.getParameterCount() == 6;
-
-            // Optional: F1 support. Failure here is fine.
-            try {
-                optionsField = fieldBySimpleType(mcClass, "Options");
-                if (optionsField != null) {
-                    hideGuiField = optionsField.getType().getField("hideGui");
-                    hideGuiField.setAccessible(true);
-                }
-            } catch (Throwable ignored) {
-                optionsField = null;
-                hideGuiField = null;
-            }
 
             Hooks.log("HUD ready (text method " + textMethod.getName() + ")");
         } catch (Throwable t) {
@@ -178,19 +176,6 @@ final class Hud {
             for (Field f : c.getDeclaredFields()) {
                 if (Modifier.isStatic(f.getModifiers())) continue;
                 if (f.getType().getSimpleName().equals(simpleName)) {
-                    f.setAccessible(true);
-                    return f;
-                }
-            }
-        }
-        return null;
-    }
-
-    private static Field fieldByExactType(Class<?> owner, String typeName) {
-        for (Class<?> c = owner; c != null; c = c.getSuperclass()) {
-            for (Field f : c.getDeclaredFields()) {
-                if (Modifier.isStatic(f.getModifiers())) continue;
-                if (f.getType().getName().equals(typeName)) {
                     f.setAccessible(true);
                     return f;
                 }

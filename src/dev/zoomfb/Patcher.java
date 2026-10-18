@@ -35,8 +35,8 @@ import java.util.Set;
  *     It is the float-returning method containing the constant 0.85714287F (the
  *     water/effect FOV scale). Every FRETURN in it gets a call to Hooks.fov(float).
  *
- *  3. HUD: in net/minecraft/client/gui/Gui, the public (GuiGraphics*, DeltaTracker) -> void
- *     method gets a call to Hooks.hud(graphics) before each RETURN (FPS and coordinates).
+ *  3. HUD: in net/minecraft/client/gui/Hud, the public (GuiGraphics*, DeltaTracker) -> void
+ *     render method gets a call to Hooks.hud(this, graphics) before each RETURN.
  *
  *  2. FULLBRIGHT: every read of LightmapRenderState.brightness and
  *     LightmapRenderState.nightVisionEffectIntensity (outside the extractor class) is
@@ -45,9 +45,9 @@ import java.util.Set;
 final class Patcher implements ClassFileTransformer {
 
     private static final String CAMERA = "net/minecraft/client/Camera";
-    private static final String GUI = "net/minecraft/client/gui/Gui";
-    private static final MethodTypeDesc OBJECT_TO_VOID =
-            MethodTypeDesc.of(ConstantDescs.CD_void, ConstantDescs.CD_Object);
+    private static final String GUI = "net/minecraft/client/gui/Hud";
+    private static final MethodTypeDesc TWO_OBJECTS_TO_VOID =
+            MethodTypeDesc.of(ConstantDescs.CD_void, ConstantDescs.CD_Object, ConstantDescs.CD_Object);
     private static final ClassDesc HOOKS = ClassDesc.of("dev.zoomfb.Hooks");
     private static final MethodTypeDesc FLOAT_TO_FLOAT =
             MethodTypeDesc.of(ConstantDescs.CD_float, ConstantDescs.CD_float);
@@ -131,52 +131,79 @@ final class Patcher implements ClassFileTransformer {
     // ------------------------------------------------------------------ hud
 
     /**
-     * In net/minecraft/client/gui/Gui, finds the public instance method of shape
-     * (GuiGraphics*, DeltaTracker) returning void: the one that draws the whole in-game GUI
-     * each frame ("render" before 26.1, "extractRenderState" since). Before every RETURN it
-     * inserts  Hooks.hud(graphics)  so our text is drawn on top of the normal HUD.
+     * In net/minecraft/client/gui/Hud (26.2: the class that draws hotbar, crosshair, chat and so
+     * on), finds the public instance method of shape (GuiGraphics*, DeltaTracker) returning
+     * void whose name contains "render" (extractRenderState). Before every RETURN it inserts
+     * Hooks.hud(this, graphics) so our text is drawn on top of the normal HUD.
      */
     private byte[] patchGui(byte[] bytes) {
         ClassModel cm = cf.parse(bytes);
-        List<MethodModel> candidates = new java.util.ArrayList<>();
 
-        for (MethodModel mm : cm.methods()) {
-            if (mm.code().isEmpty()) continue;
-            if (!mm.flags().has(AccessFlag.PUBLIC) || mm.flags().has(AccessFlag.STATIC)) continue;
-            MethodTypeDesc d = mm.methodTypeSymbol();
-            if (!d.returnType().equals(ConstantDescs.CD_void) || d.parameterCount() != 2) continue;
-            if (!d.parameterType(0).displayName().startsWith("GuiGraphics")) continue;
-            if (!d.parameterType(1).displayName().endsWith("DeltaTracker")) continue;
-            candidates.add(mm);
-        }
-
-        if (candidates.isEmpty()) {
-            Hooks.log("WARNING: could not find the GUI render method in Gui (HUD disabled). "
-                    + "Minecraft's code may have changed.");
-            return null;
-        }
-        MethodModel chosen = candidates.get(0);
-        if (candidates.size() > 1) {
-            for (MethodModel mm : candidates) {
-                if (mm.methodName().stringValue().toLowerCase().contains("render")) {
+        // Tier 1: public instance void method (GuiGraphics*, DeltaTracker).
+        // Tier 2: same shape but any visibility, name must contain "render".
+        // Tier 3: any non-static void method whose FIRST parameter is a GuiGraphics*, name
+        //         contains "render" (covers a changed second parameter).
+        MethodModel chosen = null;
+        for (int tier = 1; tier <= 3 && chosen == null; tier++) {
+            List<MethodModel> found = new java.util.ArrayList<>();
+            for (MethodModel mm : cm.methods()) {
+                if (mm.code().isEmpty() || mm.flags().has(AccessFlag.STATIC)) continue;
+                MethodTypeDesc d = mm.methodTypeSymbol();
+                if (!d.returnType().equals(ConstantDescs.CD_void)) continue;
+                if (d.parameterCount() < 1 || !d.parameterType(0).displayName().startsWith("GuiGraphics")) continue;
+                boolean twoParams = d.parameterCount() == 2
+                        && d.parameterType(1).displayName().endsWith("DeltaTracker");
+                boolean render = mm.methodName().stringValue().toLowerCase().contains("render");
+                boolean pub = mm.flags().has(AccessFlag.PUBLIC);
+                boolean ok = switch (tier) {
+                    case 1 -> twoParams && pub;
+                    case 2 -> twoParams && render;
+                    default -> render;
+                };
+                if (ok) found.add(mm);
+            }
+            if (found.isEmpty()) continue;
+            chosen = found.get(0);
+            for (MethodModel mm : found) {
+                if (mm.methodName().stringValue().toLowerCase().contains("render")
+                        && mm.flags().has(AccessFlag.PUBLIC)) {
                     chosen = mm;
                     break;
                 }
             }
-            Hooks.log("note: several GUI render candidates, using " + key(chosen));
+            if (found.size() > 1) {
+                StringBuilder sb = new StringBuilder();
+                for (MethodModel mm : found) sb.append(key(mm)).append("  ");
+                Hooks.log("note: " + found.size() + " GUI render candidates (tier " + tier + "): "
+                        + sb + "-> using " + key(chosen));
+            }
         }
 
+        if (chosen == null) {
+            Hooks.log("WARNING: could not find the render method in Hud (HUD disabled). "
+                    + "Methods in Hud that involve a graphics type:");
+            for (MethodModel mm : cm.methods()) {
+                String desc = mm.methodType().stringValue();
+                if (desc.contains("Graphics")) {
+                    Hooks.log("    " + mm.flags().flagsMask() + " " + key(mm));
+                }
+            }
+            return null;
+        }
+
+        final int graphicsSlot = 1; // instance method: slot 0 is "this", slot 1 the first parameter
         String chosenKey = key(chosen);
         byte[] out = cf.transformClass(cm, ClassTransform.transformingMethodBodies(
                 mm -> key(mm).equals(chosenKey),
                 (CodeBuilder b, CodeElement e) -> {
                     if (e instanceof ReturnInstruction r && r.opcode() == Opcode.RETURN) {
-                        b.aload(1);
-                        b.invokestatic(HOOKS, "hud", OBJECT_TO_VOID);
+                        b.aload(0);             // this (the Hud instance)
+                        b.aload(graphicsSlot);  // the GuiGraphicsExtractor
+                        b.invokestatic(HOOKS, "hud", TWO_OBJECTS_TO_VOID);
                     }
                     b.with(e);
                 }));
-        Hooks.log("patched HUD hook into Gui " + chosenKey);
+        Hooks.log("patched HUD hook into Hud " + chosenKey);
         return out;
     }
 
