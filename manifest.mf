@@ -1,0 +1,2 @@
+Premain-Class: dev.zoomfb.Agent
+Can-Retransform-Classes: false
